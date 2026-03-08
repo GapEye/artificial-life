@@ -1,10 +1,19 @@
 import argparse
 from pathlib import Path
 
+import numba
 import numpy as np
 from numba import njit, prange
 from PIL import Image
 from tqdm import tqdm
+
+try:
+    from numba import cuda
+
+    _cuda_available = cuda.is_available()
+except Exception:
+    cuda = None  # type: ignore[assignment]
+    _cuda_available = False
 
 ZERO, ONE = np.uint8(0), np.uint8(1)
 LT, GT, LB, RB, MINUS, PLUS, DOT, COMMA, LBRACK, RBRACK = map(ord, "<>{}-+.,[]")
@@ -203,12 +212,95 @@ def opcode_token_percent(programs: np.ndarray) -> float:
     return 100.0 * float(counts[OPCODE_TOKENS].sum()) / float(programs.size)
 
 
+# ---------------------------------------------------------------------------
+# CUDA device functions and kernel (only compiled when CUDA is available)
+# ---------------------------------------------------------------------------
+
+if _cuda_available:
+
+    @cuda.jit(device=True)
+    def seek_match_cuda(tape, tape_size, pc, step, open_tok, close_tok):
+        depth = 1
+        pc += step
+        while pc >= 0 and pc < tape_size and depth > 0:
+            opcode = tape[pc]
+            if opcode == open_tok:
+                depth += 1
+            elif opcode == close_tok:
+                depth -= 1
+            pc += step
+        if depth == 0:
+            return pc - step
+        return -1
+
+    @cuda.jit(device=True)
+    def run_tape_cuda(tape, tape_size, max_iterations):
+        pc = 0
+        head0 = 0
+        head1 = 0
+        for _ in range(max_iterations):
+            if pc < 0 or pc >= tape_size:
+                break
+            opcode = tape[pc]
+            if opcode == LT or opcode == GT:
+                if opcode == GT:
+                    head0 = (head0 + 1) % tape_size
+                else:
+                    head0 = (head0 + tape_size - 1) % tape_size
+            elif opcode == LB or opcode == RB:
+                if opcode == RB:
+                    head1 = (head1 + 1) % tape_size
+                else:
+                    head1 = (head1 + tape_size - 1) % tape_size
+            elif opcode == MINUS or opcode == PLUS:
+                if opcode == MINUS:
+                    tape[head0] = tape[head0] - 1
+                else:
+                    tape[head0] = tape[head0] + 1
+            elif opcode == DOT:
+                tape[head1] = tape[head0]
+            elif opcode == COMMA:
+                tape[head0] = tape[head1]
+            elif opcode == LBRACK and tape[head0] == 0:
+                pc = seek_match_cuda(tape, tape_size, pc, 1, LBRACK, RBRACK)
+                if pc < 0:
+                    break
+            elif opcode == RBRACK and tape[head0] != 0:
+                pc = seek_match_cuda(tape, tape_size, pc, -1, RBRACK, LBRACK)
+                if pc < 0:
+                    break
+            pc += 1
+
+    @cuda.jit
+    def run_epoch_pairs_kernel(programs, pairs, pair_count):
+        pair_idx = cuda.grid(1)
+        if pair_idx >= pair_count:
+            return
+        tape_size = programs.shape[1]
+        tape = cuda.local.array(128, numba.uint8)  # 64*2 concat tape
+        idx_a = pairs[pair_idx, 0]
+        idx_b = pairs[pair_idx, 1]
+        for i in range(tape_size):
+            tape[i] = programs[idx_a, i]
+            tape[tape_size + i] = programs[idx_b, i]
+        run_tape_cuda(tape, tape_size * 2, 2**13)
+        for i in range(tape_size):
+            programs[idx_a, i] = tape[i]
+            programs[idx_b, i] = tape[tape_size + i]
+
+
+# ---------------------------------------------------------------------------
+# Main loop
+# ---------------------------------------------------------------------------
+
+
 def run_epochs(
     programs: np.ndarray,
     nepochs: int,
     mutation_rate: float,
     rng: np.random.Generator,
     gif_every: int,
+    device: str = "cpu",
 ) -> list[Image.Image]:
     grid_width, grid_height, tape_size = programs.shape
     num_programs = grid_width * grid_height
@@ -224,6 +316,11 @@ def run_epochs(
     frames: list[Image.Image] = []
     color_lut = build_color_lut()
 
+    if device == "cuda":
+        d_programs = cuda.to_device(flat_programs)
+        d_pairs = cuda.device_array_like(pairs)
+        threads_per_block = 256
+
     pbar = tqdm(range(nepochs))
     for epoch in pbar:
         order = rng.permutation(num_programs).astype(np.int32, copy=False)
@@ -236,14 +333,36 @@ def run_epochs(
             proposals[valid_rows] = neighbors[valid_rows, choices]
 
         pair_count = select_pairs(order, proposals, pairs, taken)
-        run_epoch_pairs(flat_programs, pairs, pair_count)
-        apply_background_mutation(programs, mutation_rate, rng)
-        if color_lut is not None and (
+
+        if device == "cuda":
+            d_pairs.copy_to_device(pairs)
+            if pair_count > 0:
+                blocks = (pair_count + threads_per_block - 1) // threads_per_block
+                run_epoch_pairs_kernel[blocks, threads_per_block](
+                    d_programs, d_pairs, pair_count
+                )
+        else:
+            run_epoch_pairs(flat_programs, pairs, pair_count)
+
+        need_frame = color_lut is not None and (
             (epoch + 1) % gif_every == 0 or epoch + 1 == nepochs or epoch == 0
-        ):
+        )
+
+        if device == "cuda":
+            # Copy to host whenever we need current data (mutation or frame)
+            if mutation_rate > 0 or need_frame:
+                d_programs.copy_to_host(flat_programs)
+            apply_background_mutation(programs, mutation_rate, rng)
+            if mutation_rate > 0:
+                d_programs.copy_to_device(flat_programs)
+        else:
+            apply_background_mutation(programs, mutation_rate, rng)
+
+        if need_frame:
             frames.append(
                 Image.fromarray(render_program_frame(programs, color_lut), mode="RGB")
             )
+
         pbar.set_postfix_str(f"opcode={opcode_token_percent(programs):.2f}%")
 
     return frames
@@ -269,8 +388,16 @@ if __name__ == "__main__":
     )
     parser.add_argument("--gif-every", type=int, default=20)
     parser.add_argument("--gif-fps", type=int, default=20)
+    parser.add_argument(
+        "--device",
+        choices=["cpu", "cuda"],
+        default="cuda" if _cuda_available else "cpu",
+        help="Compute device (default: cuda if available, else cpu)",
+    )
     args = parser.parse_args()
 
+    if args.device == "cuda" and not _cuda_available:
+        raise RuntimeError("--device cuda requested but CUDA is not available")
     if args.grid_width * args.grid_height != args.num_programs:
         raise ValueError("grid_width * grid_height must equal num_programs")
     if args.gif_every <= 0:
@@ -291,6 +418,7 @@ if __name__ == "__main__":
         args.mutation_rate,
         rng,
         gif_every=args.gif_every,
+        device=args.device,
     )
     save_evolution_gif(frames, args.gif_path, args.gif_fps)
     print(f"wrote GIF: {Path(args.gif_path).resolve()}")

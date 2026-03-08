@@ -217,6 +217,7 @@ def opcode_token_percent(programs: np.ndarray) -> float:
 # ---------------------------------------------------------------------------
 
 if _cuda_available:
+    from numba.cuda.random import create_xoroshiro128p_states, xoroshiro128p_uniform_float32
 
     @cuda.jit(device=True)
     def seek_match_cuda(tape, tape_size, pc, step, open_tok, close_tok):
@@ -272,21 +273,42 @@ if _cuda_available:
             pc += 1
 
     @cuda.jit
-    def run_epoch_pairs_kernel(programs, pairs, pair_count):
-        pair_idx = cuda.grid(1)
-        if pair_idx >= pair_count:
+    def run_epoch_kernel(
+        programs_in, programs_out, neighbors, neighbor_counts, rng_states, mutation_rate
+    ):
+        """One thread per program. Reads neighbor from programs_in (snapshot),
+        writes updated self to programs_out (double-buffer — no write races).
+        Mutation is applied on-GPU, eliminating all per-epoch CPU↔GPU copies."""
+        idx = cuda.grid(1)
+        n = programs_in.shape[0]
+        if idx >= n:
             return
-        tape_size = programs.shape[1]
-        tape = cuda.local.array(128, numba.uint8)  # 64*2 concat tape
-        idx_a = pairs[pair_idx, 0]
-        idx_b = pairs[pair_idx, 1]
+
+        tape_size = programs_in.shape[1]  # 64
+        tape = cuda.local.array(128, numba.uint8)  # 64*2 concat
+
+        nc = neighbor_counts[idx]
+        if nc > 0:
+            # Pick a random neighbor from the pre-epoch snapshot
+            r = xoroshiro128p_uniform_float32(rng_states, idx)
+            n_idx = neighbors[idx, int(r * nc)]
+            for i in range(tape_size):
+                tape[i] = programs_in[idx, i]
+                tape[tape_size + i] = programs_in[n_idx, i]
+            run_tape_cuda(tape, tape_size * 2, 2**13)
+        else:
+            for i in range(tape_size):
+                tape[i] = programs_in[idx, i]
+
+        # Write self-half back, applying mutation inline
         for i in range(tape_size):
-            tape[i] = programs[idx_a, i]
-            tape[tape_size + i] = programs[idx_b, i]
-        run_tape_cuda(tape, tape_size * 2, 2**13)
-        for i in range(tape_size):
-            programs[idx_a, i] = tape[i]
-            programs[idx_b, i] = tape[tape_size + i]
+            val = tape[i]
+            if mutation_rate > 0.0:
+                r = xoroshiro128p_uniform_float32(rng_states, idx)
+                if r < mutation_rate:
+                    r2 = xoroshiro128p_uniform_float32(rng_states, idx)
+                    val = numba.uint8(int(r2 * 256))
+            programs_out[idx, i] = val
 
 
 # ---------------------------------------------------------------------------
@@ -306,64 +328,72 @@ def run_epochs(
     num_programs = grid_width * grid_height
     flat_programs = programs.reshape(num_programs, tape_size)
     neighbors, neighbor_counts = build_neighborhood(grid_width, grid_height)
-    rows = np.arange(num_programs, dtype=np.int32)
-    valid_rows = rows[neighbor_counts > 0]
-    valid_neighbor_counts = neighbor_counts[valid_rows]
-    all_rows_are_valid = valid_rows.size == num_programs
-    pairs = np.empty((num_programs // 2, 2), dtype=np.int32)
-    proposals = np.empty(num_programs, dtype=np.int32)
-    taken = np.empty(num_programs, dtype=np.uint8)
     frames: list[Image.Image] = []
     color_lut = build_color_lut()
 
     if device == "cuda":
-        d_programs = cuda.to_device(flat_programs)
-        d_pairs = cuda.device_array_like(pairs)
-        threads_per_block = 256
+        # Upload programs and neighborhood once; stay resident on GPU.
+        d_programs_a = cuda.to_device(flat_programs)
+        d_programs_b = cuda.device_array_like(flat_programs)
+        d_neighbors = cuda.to_device(neighbors)
+        d_neighbor_counts = cuda.to_device(neighbor_counts)
+        # One RNG state per program — GPU handles all randomness.
+        rng_states = create_xoroshiro128p_states(
+            num_programs, seed=int(rng.integers(2**31))
+        )
+        threads_per_block = 128
+        blocks = (num_programs + threads_per_block - 1) // threads_per_block
+        d_in, d_out = d_programs_a, d_programs_b
+    else:
+        rows = np.arange(num_programs, dtype=np.int32)
+        valid_rows = rows[neighbor_counts > 0]
+        valid_neighbor_counts = neighbor_counts[valid_rows]
+        all_rows_are_valid = valid_rows.size == num_programs
+        pairs = np.empty((num_programs // 2, 2), dtype=np.int32)
+        proposals = np.empty(num_programs, dtype=np.int32)
+        taken = np.empty(num_programs, dtype=np.uint8)
 
     pbar = tqdm(range(nepochs))
     for epoch in pbar:
-        order = rng.permutation(num_programs).astype(np.int32, copy=False)
-        if all_rows_are_valid:
-            choices = rng.integers(0, neighbor_counts)
-            proposals[:] = neighbors[rows, choices]
-        else:
-            proposals.fill(-1)
-            choices = rng.integers(0, valid_neighbor_counts)
-            proposals[valid_rows] = neighbors[valid_rows, choices]
-
-        pair_count = select_pairs(order, proposals, pairs, taken)
+        need_frame = (epoch + 1) % gif_every == 0 or epoch + 1 == nepochs or epoch == 0
 
         if device == "cuda":
-            d_pairs.copy_to_device(pairs)
-            if pair_count > 0:
-                blocks = (pair_count + threads_per_block - 1) // threads_per_block
-                run_epoch_pairs_kernel[blocks, threads_per_block](
-                    d_programs, d_pairs, pair_count
-                )
-        else:
-            run_epoch_pairs(flat_programs, pairs, pair_count)
-
-        need_frame = color_lut is not None and (
-            (epoch + 1) % gif_every == 0 or epoch + 1 == nepochs or epoch == 0
-        )
-
-        if device == "cuda":
-            # Copy to host whenever we need current data (mutation or frame)
-            if mutation_rate > 0 or need_frame:
-                d_programs.copy_to_host(flat_programs)
-            apply_background_mutation(programs, mutation_rate, rng)
-            if mutation_rate > 0:
-                d_programs.copy_to_device(flat_programs)
-        else:
-            apply_background_mutation(programs, mutation_rate, rng)
-
-        if need_frame:
-            frames.append(
-                Image.fromarray(render_program_frame(programs, color_lut), mode="RGB")
+            # Kernel: one thread per program, GPU RNG, double-buffer (no races),
+            # mutation on-GPU. Zero CPU↔GPU copies in the hot path.
+            run_epoch_kernel[blocks, threads_per_block](
+                d_in, d_out, d_neighbors, d_neighbor_counts, rng_states, mutation_rate
             )
+            d_in, d_out = d_out, d_in  # d_in now holds the updated generation
 
-        pbar.set_postfix_str(f"opcode={opcode_token_percent(programs):.2f}%")
+            if need_frame:
+                d_in.copy_to_host(flat_programs)
+                frames.append(
+                    Image.fromarray(render_program_frame(programs, color_lut), mode="RGB")
+                )
+                pbar.set_postfix_str(f"opcode={opcode_token_percent(programs):.2f}%")
+        else:
+            order = rng.permutation(num_programs).astype(np.int32, copy=False)
+            if all_rows_are_valid:
+                choices = rng.integers(0, neighbor_counts)
+                proposals[:] = neighbors[rows, choices]
+            else:
+                proposals.fill(-1)
+                choices = rng.integers(0, valid_neighbor_counts)
+                proposals[valid_rows] = neighbors[valid_rows, choices]
+
+            pair_count = select_pairs(order, proposals, pairs, taken)
+            run_epoch_pairs(flat_programs, pairs, pair_count)
+            apply_background_mutation(programs, mutation_rate, rng)
+
+            if need_frame:
+                frames.append(
+                    Image.fromarray(render_program_frame(programs, color_lut), mode="RGB")
+                )
+            pbar.set_postfix_str(f"opcode={opcode_token_percent(programs):.2f}%")
+
+    if device == "cuda":
+        # Final sync so programs reflects the last state on return.
+        d_in.copy_to_host(flat_programs)
 
     return frames
 
